@@ -1,0 +1,312 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEClient.h>
+
+// BLE UUIDs (must match primary ESP32)
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// LED indicator pin
+#define LED_PIN 2 // Built-in LED for ESP32 DevKit V1
+
+BLEClient* pClient = NULL;
+BLERemoteCharacteristic* pRemoteCharacteristic = NULL;
+bool deviceConnected = false;
+bool doScan = false;
+String ultrasonicData = "";
+
+// RSSI estimation variables
+#define RSSI_SAMPLES 8
+int rssiBuffer[RSSI_SAMPLES] = {0};
+int rssiIndex = 0;
+float filteredRssi = 0;
+float smoothingFactor = 0.2; // EMA smoothing factor (0-1)
+
+// RSSI calibration parameters
+const float RSSI_AT_1M = -69.0; // RSSI value at 1 meter distance (needs calibration)
+
+// Heading estimation variables
+bool headingEstimationMode = false;
+unsigned long headingEstimationStartTime = 0;
+int rssiReadings[8] = {0};  // 8 directions (0, 45, 90, 135, 180, 225, 270, 315 degrees)
+int currentDirection = 0;
+float estimatedHeading = 0.0;
+
+// Navigation data
+float distance = 0.0;
+
+// Timing variables
+unsigned long lastSendTime = 0;
+const int SEND_INTERVAL = 100; // ms
+unsigned long lastBlinkTime = 0;
+const int BLINK_INTERVAL = 500; // ms
+bool ledState = false;
+
+// Function to process RSSI readings
+float processRSSI(int newRssi) {
+  // Add to buffer
+  rssiBuffer[rssiIndex] = newRssi;
+  rssiIndex = (rssiIndex + 1) % RSSI_SAMPLES;
+  
+  // Calculate average
+  int sum = 0;
+  for (int i = 0; i < RSSI_SAMPLES; i++) {
+    sum += rssiBuffer[i];
+  }
+  float avgRssi = (float)sum / RSSI_SAMPLES;
+  
+  // Apply exponential moving average
+  if (filteredRssi == 0) {
+    filteredRssi = avgRssi; // Initialize
+  } else {
+    filteredRssi = smoothingFactor * avgRssi + (1 - smoothingFactor) * filteredRssi;
+  }
+  
+  return filteredRssi;
+}
+
+// Improved distance calculation from RSSI
+float calculateDistanceFromRSSI(int rssi) {
+  if (rssi == 0) {
+    return -1.0; // Error case
+  }
+  
+  // Process RSSI through buffering and filtering
+  float filteredRssi = processRSSI(rssi);
+  
+  // Use a more sophisticated mapping model
+  // This is a multi-segment model that can be calibrated
+  if (filteredRssi > -50) {
+    // Very close (less than ~1m)
+    return 0.5 * pow(10, (RSSI_AT_1M - filteredRssi) / (10 * 2.0));
+  } else if (filteredRssi > -70) {
+    // Medium range (1-3m)
+    return 0.7 * pow(10, (RSSI_AT_1M - filteredRssi) / (10 * 2.2));
+  } else {
+    // Farther range (>3m)
+    return 1.0 * pow(10, (RSSI_AT_1M - filteredRssi) / (10 * 2.5));
+  }
+}
+
+// Function to estimate heading based on RSSI gradient
+void estimateHeading() {
+  const unsigned long ESTIMATION_TIMEOUT = 30000;  // 30 seconds max
+  unsigned long currentTime = millis();
+  
+  // Start heading estimation mode if not already running
+  if (!headingEstimationMode) {
+    headingEstimationMode = true;
+    headingEstimationStartTime = currentTime;
+    currentDirection = 0;
+    Serial.println("Starting heading estimation...");
+    return;
+  }
+  
+  // Check if we've been in this mode too long
+  if (currentTime - headingEstimationStartTime > ESTIMATION_TIMEOUT) {
+    headingEstimationMode = false;
+    Serial.println("Heading estimation timed out");
+    return;
+  }
+  
+  // Get current RSSI reading
+  int rssi = pClient->getRssi();
+  
+  // Store RSSI reading for current direction
+  rssiReadings[currentDirection] = rssi;
+  
+  // Move to next direction
+  currentDirection++;
+  
+  // If we've checked all directions, find the strongest signal
+  if (currentDirection >= 8) {
+    int maxRssi = -100;  // Very low value
+    int maxIndex = 0;
+    
+    for (int i = 0; i < 8; i++) {
+      if (rssiReadings[i] > maxRssi) {
+        maxRssi = rssiReadings[i];
+        maxIndex = i;
+      }
+    }
+    
+    // Convert index to heading (0=0°, 1=45°, 2=90°, etc.)
+    estimatedHeading = maxIndex * 45.0;
+    
+    Serial.print("Estimated heading: ");
+    Serial.println(estimatedHeading);
+    
+    // Exit heading estimation mode
+    headingEstimationMode = false;
+  }
+}
+
+// Callback to receive data from primary ESP32
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
+                           uint8_t* pData, size_t length, bool isNotify) {
+  String receivedData = "";
+  for (int i = 0; i < length; i++) {
+    receivedData += (char)pData[i];
+  }
+  
+  if (receivedData.startsWith("U:")) {
+    ultrasonicData = receivedData;
+    Serial.print("Received ultrasonic data: ");
+    Serial.println(ultrasonicData);
+  }
+}
+
+// Connect to BLE server
+bool connectToServer(BLEAddress pAddress, int rssi) {
+  Serial.print("Connecting to ");
+  Serial.println(pAddress.toString().c_str());
+  Serial.print("RSSI: ");
+  Serial.println(rssi);
+  
+  // Calculate distance from RSSI
+  distance = calculateDistanceFromRSSI(rssi);
+  Serial.print("Estimated distance: ");
+  Serial.print(distance);
+  Serial.println(" meters");
+  
+  pClient = BLEDevice::createClient();
+  if (!pClient->connect(pAddress)) {
+    Serial.println("Connection failed");
+    return false;
+  }
+  
+  Serial.println("Connected to server");
+  
+  BLERemoteService* pRemoteService = pClient->getService(SERVICE_UUID);
+  if (pRemoteService == nullptr) {
+    Serial.println("Failed to find service UUID");
+    pClient->disconnect();
+    return false;
+  }
+  
+  pRemoteCharacteristic = pRemoteService->getCharacteristic(CHARACTERISTIC_UUID);
+  if (pRemoteCharacteristic == nullptr) {
+    Serial.println("Failed to find characteristic UUID");
+    pClient->disconnect();
+    return false;
+  }
+  
+  if (pRemoteCharacteristic->canRead()) {
+    Serial.print("Characteristic value: ");
+    Serial.println(pRemoteCharacteristic->readValue().c_str());
+  }
+  
+  if (pRemoteCharacteristic->canNotify()) {
+    pRemoteCharacteristic->registerForNotify(notifyCallback);
+  }
+  
+  deviceConnected = true;
+  return true;
+}
+
+// BLE device scanning
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    Serial.print("BLE Device found: ");
+    Serial.println(advertisedDevice.toString().c_str());
+    
+    if (advertisedDevice.haveServiceUUID() && 
+        advertisedDevice.isAdvertisingService(BLEUUID(SERVICE_UUID))) {
+      
+      // Get RSSI when we find our device
+      int rssi = advertisedDevice.getRSSI();
+      
+      BLEDevice::getScan()->stop();
+      connectToServer(advertisedDevice.getAddress(), rssi);
+      doScan = false;
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 DevKit V1 Secondary Starting...");
+  
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Startup indicator
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  // Initialize BLE
+  BLEDevice::init("ESP32_Secondary");
+  
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+  
+  doScan = true;
+  pBLEScan->start(5, false);
+  Serial.println("BLE scan started...");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // LED blink or solid based on connection status
+  if (currentTime - lastBlinkTime >= BLINK_INTERVAL) {
+    lastBlinkTime = currentTime;
+    ledState = !ledState;
+    digitalWrite(LED_PIN, deviceConnected ? HIGH : (ledState ? HIGH : LOW));
+  }
+  
+  // If not connected, restart scan
+  if (!deviceConnected && !doScan) {
+    BLEDevice::getScan()->start(0);
+    doScan = true;
+    Serial.println("Restarting BLE scan...");
+  }
+  
+  // Periodically estimate heading (every 2 minutes)
+  if (deviceConnected && !headingEstimationMode && (currentTime % 120000 < 100)) {
+    estimateHeading();
+  }
+  
+  // If connected, send navigation data
+  if (deviceConnected && (currentTime - lastSendTime >= SEND_INTERVAL)) {
+    lastSendTime = currentTime;
+    
+    // Update distance estimate during each connection
+    int rssi = 0;
+    if (pClient->isConnected()) {
+      rssi = pClient->getRssi();
+      // Update distance based on current RSSI
+      distance = calculateDistanceFromRSSI(rssi);
+    }
+    
+    // Format navigation data in the expected format: "H:heading,D:distance"
+    String navData = "H:";
+    navData += String(estimatedHeading, 1);  // Use estimated heading
+    navData += ",D:";
+    navData += String(distance * 100, 1);    // Convert meters to cm
+    
+    if (pRemoteCharacteristic != NULL) {
+      pRemoteCharacteristic->writeValue(navData.c_str(), navData.length());
+      Serial.print("Sent data: ");
+      Serial.println(navData);
+      Serial.print("Current RSSI: ");
+      Serial.println(rssi);
+    }
+  }
+  
+  // Check if still connected
+  if (pClient != NULL && deviceConnected && !pClient->isConnected()) {
+    deviceConnected = false;
+    Serial.println("Disconnected from server");
+  }
+  
+  delay(10);
+}
