@@ -1,0 +1,272 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+// Ultrasonic sensor pins - MODIFIED FOR ESP32 S3
+// ESP32 S3 has different pin numbers and capabilities
+// Using GPIO pins compatible with S3
+const int TRIG_PIN_FRONT = 1;
+const int ECHO_PIN_FRONT = 2;
+const int TRIG_PIN_LEFT = 3;
+const int ECHO_PIN_LEFT = 4;
+const int TRIG_PIN_RIGHT = 5;
+const int ECHO_PIN_RIGHT = 6;
+const int TRIG_PIN_BACK = 7;
+const int ECHO_PIN_BACK = 8;
+
+// Status LED pin - ESP32 S3 has a built-in LED
+const int LED_PIN = 38;  // Built-in LED on most ESP32-S3 boards
+
+// BLE UUIDs
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// BLE variables
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+String incomingNavData = "";
+
+// Sensor data
+float frontDistance = 0;
+float leftDistance = 0;
+float rightDistance = 0;
+float backDistance = 0;
+
+// Navigation data from secondary ESP32
+float externalHeading = 0;
+float externalDistance = 0;
+bool hasNewNavData = false;
+
+// Sample rate control
+unsigned long lastReadTime = 0;
+const int READ_INTERVAL = 100; // ms
+unsigned long lastBlinkTime = 0;
+const int BLINK_INTERVAL = 1000; // ms
+
+// Function prototypes
+void parseNavData();
+
+// Communication format with Raspberry Pi: <C:123.4,L:123.4,R:123.4,B:123.4,H:123.4,D:123.4>
+// Where H is heading and D is additional distance data from secondary ESP32
+
+// BLE Server Callbacks
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      digitalWrite(LED_PIN, HIGH);  // Turn on LED when connected
+      Serial.println("Device connected");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      digitalWrite(LED_PIN, LOW);  // Turn off LED when disconnected
+      Serial.println("Device disconnected");
+    }
+};
+
+// BLE Characteristic Callbacks to receive data
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      // Get the raw data
+      incomingNavData = pCharacteristic->getValue();  // Directly assign to Arduino String
+      
+      if (incomingNavData.length() > 0) {
+        parseNavData();
+        hasNewNavData = true;
+      }
+    }
+};
+
+void parseNavData() {
+  // Expected format: "H:123.4,D:123.4"
+  if (incomingNavData.indexOf("H:") >= 0 && incomingNavData.indexOf("D:") >= 0) {
+    int hStart = incomingNavData.indexOf("H:") + 2;
+    int hEnd = incomingNavData.indexOf(",", hStart);
+    int dStart = incomingNavData.indexOf("D:") + 2;
+    int dEnd = incomingNavData.length();
+    
+    String headingStr = incomingNavData.substring(hStart, hEnd);
+    String distanceStr = incomingNavData.substring(dStart, dEnd);
+    
+    externalHeading = headingStr.toFloat();
+    externalDistance = distanceStr.toFloat();
+    
+    Serial.print("Received nav data - Heading: ");
+    Serial.print(externalHeading);
+    Serial.print(", Distance: ");
+    Serial.println(externalDistance);
+  }
+}
+
+float readUltrasonicDistance(int trigPin, int echoPin) {
+  // Clear the trigger pin
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  
+  // Set the trigger pin HIGH for 10 microseconds
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Read the echo pin (convert time to distance)
+  // Sound speed in air = 343m/s = 0.0343cm/µs
+  // Distance = (time * 0.0343) / 2 (divide by 2 for round trip)
+  float duration = pulseIn(echoPin, HIGH, 30000); // Timeout after 30ms (about 5m range)
+  
+  // Check for timeout (no echo received)
+  if (duration == 0) {
+    return 999.0; // Return large value to indicate no obstacle
+  }
+  
+  float distance = (duration * 0.0343) / 2;
+  
+  // Cap at reasonable range for reliability
+  if (distance > 400) {
+    distance = 400;
+  }
+  
+  return distance;
+}
+
+void readAllSensors() {
+  frontDistance = readUltrasonicDistance(TRIG_PIN_FRONT, ECHO_PIN_FRONT);
+  leftDistance = readUltrasonicDistance(TRIG_PIN_LEFT, ECHO_PIN_LEFT);
+  rightDistance = readUltrasonicDistance(TRIG_PIN_RIGHT, ECHO_PIN_RIGHT);
+  backDistance = readUltrasonicDistance(TRIG_PIN_BACK, ECHO_PIN_BACK);
+}
+
+void sendDataToRaspberryPi() {
+  // Send all data to Raspberry Pi
+  String output = "<C:";
+  output += String(frontDistance, 1);
+  output += ",L:";
+  output += String(leftDistance, 1);
+  output += ",R:";
+  output += String(rightDistance, 1);
+  output += ",B:";
+  output += String(backDistance, 1);
+  
+  // Add navigation data from secondary ESP32 if available
+  output += ",H:";
+  output += String(externalHeading, 1);
+  output += ",D:";
+  output += String(externalDistance, 1);
+  output += ">";
+  
+  Serial.println(output);
+}
+
+void setup() {
+  // Initialize serial communication with Raspberry Pi
+  Serial.begin(115200);
+  delay(1000);  // ESP32 S3 sometimes needs a bit more time to initialize serial
+  Serial.println("ESP32 S3 Primary (Ultrasonic + BLE) starting...");
+  
+  // Configure LED pin
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Configure ultrasonic sensor pins
+  pinMode(TRIG_PIN_FRONT, OUTPUT);
+  pinMode(ECHO_PIN_FRONT, INPUT);
+  pinMode(TRIG_PIN_LEFT, OUTPUT);
+  pinMode(ECHO_PIN_LEFT, INPUT);
+  pinMode(TRIG_PIN_RIGHT, OUTPUT);
+  pinMode(ECHO_PIN_RIGHT, INPUT);
+  pinMode(TRIG_PIN_BACK, OUTPUT);
+  pinMode(ECHO_PIN_BACK, INPUT);
+  
+  // Initialize BLE Server - ESP32 S3 requires specific BLE initialization
+  BLEDevice::init("ESP32S3_Robot_Primary");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY |
+                      BLECharacteristic::PROPERTY_INDICATE
+                    );
+  
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+  
+  pService->start();
+  
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("BLE server ready, waiting for connections...");
+  
+  // Quick LED test to confirm boot
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+void loop() {
+  // Read sensors at regular intervals
+  unsigned long currentTime = millis();
+  if (currentTime - lastReadTime >= READ_INTERVAL) {
+    lastReadTime = currentTime;
+    
+    // Read ultrasonic sensors
+    readAllSensors();
+    
+    // Send data to Raspberry Pi
+    sendDataToRaspberryPi();
+    
+    // Send our sensor data to secondary ESP32 if connected
+    if (deviceConnected) {
+      // Create simple string with ultrasonic data for secondary ESP32
+      String navDataOut = "U:";
+      navDataOut += String(frontDistance, 1);
+      navDataOut += ",";
+      navDataOut += String(leftDistance, 1);
+      navDataOut += ",";
+      navDataOut += String(rightDistance, 1);
+      navDataOut += ",";
+      navDataOut += String(backDistance, 1);
+      
+      // Convert Arduino String to std::string for BLE
+      pCharacteristic->setValue(navDataOut.c_str());
+      pCharacteristic->notify();
+    }
+  }
+  
+  // Reconnection handling
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500); // Give the Bluetooth stack time to get ready
+    pServer->startAdvertising(); // Restart advertising
+    Serial.println("Started advertising, waiting for connection...");
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  // Connection establishment
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  // Blink LED when not connected to indicate status
+  if (!deviceConnected) {
+    if (currentTime - lastBlinkTime >= BLINK_INTERVAL) {
+      lastBlinkTime = currentTime;
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));  // Toggle LED
+    }
+  }
+}
