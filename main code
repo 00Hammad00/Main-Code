@@ -1,0 +1,1085 @@
+import cv2
+import numpy as np
+import time
+import serial
+import threading
+import os
+import math
+from gpiozero import DigitalOutputDevice, PWMOutputDevice
+
+# ===== CONFIGURATION =====
+# Debug/testing mode
+DEBUG_MODE = True
+TEST_MOTORS_ON_START = False
+
+# Motor pin definitions (Yahboom configuration)
+LEFT_PWM_PIN = 16
+LEFT_IN1_PIN = 20
+LEFT_IN2_PIN = 21
+RIGHT_PWM_PIN = 13
+RIGHT_IN3_PIN = 19
+RIGHT_IN4_PIN = 26
+
+# ESP32 USB port for sensors
+# This will be auto-detected, but you can set it manually
+ESP32_PORT = None  # '/dev/ttyUSB0' or '/dev/ttyACM0'
+ESP32_BAUD = 115200
+
+# Target parameters
+TARGET_DISTANCE = 100.0  # We want to maintain 100cm from the marker
+POSITION_THRESHOLD = 100  # Pixels from center before turning
+DISTANCE_THRESHOLD = 5   # cm from target distance before moving
+
+# Obstacle parameters
+OBSTACLE_THRESHOLD = 10  # cm distance to consider as an obstacle
+OBSTACLE_AVOIDANCE_MODE = True
+
+# ArUco marker settings
+MARKER_ID = 0
+MARKER_SIZE_CM = 20.0  # 20x20 cm marker
+FOCAL_LENGTH = 900     # Approximate focal length for 640x480 camera
+
+# ===== MOTOR CONTROL =====
+class MotorController:
+    def __init__(self):
+        # Initialize motor pins
+        self.left_pwm = PWMOutputDevice(LEFT_PWM_PIN)
+        self.left_in1 = DigitalOutputDevice(LEFT_IN1_PIN)
+        self.left_in2 = DigitalOutputDevice(LEFT_IN2_PIN)
+        self.right_pwm = PWMOutputDevice(RIGHT_PWM_PIN)
+        self.right_in3 = DigitalOutputDevice(RIGHT_IN3_PIN)
+        self.right_in4 = DigitalOutputDevice(RIGHT_IN4_PIN)
+        
+        # Set PWM frequency
+        self.left_pwm.frequency = 1000  # 1000Hz for smoother control
+        self.right_pwm.frequency = 1000
+        
+        # Stop motors initially
+        self.stop()
+        print("Motor controller initialized")
+    
+    def stop(self):
+        """Stop both motors"""
+        self.left_in1.off()
+        self.left_in2.off()
+        self.right_in3.off()
+        self.right_in4.off()
+        self.left_pwm.value = 0
+        self.right_pwm.value = 0
+        if DEBUG_MODE:
+            print("Motors stopped")
+    
+    def set_speeds(self, left_speed, right_speed):
+        """
+        Set speed and direction of both motors
+        Speed ranges from -100 to 100:
+        - Negative values: reverse
+        - Positive values: forward
+        - 0: stop
+        """
+        # Ensure minimum threshold to prevent stalling
+        if 0 < abs(left_speed) < 10:
+            left_speed = 10 * (1 if left_speed > 0 else -1)
+        if 0 < abs(right_speed) < 10:
+            right_speed = 10 * (1 if right_speed > 0 else -1)
+        
+        # Set left motor
+        if left_speed > 0:
+            self.left_in1.on()
+            self.left_in2.off()
+            self.left_pwm.value = min(abs(left_speed) / 100, 1.0)
+        elif left_speed < 0:
+            self.left_in1.off()
+            self.left_in2.on()
+            self.left_pwm.value = min(abs(left_speed) / 100, 1.0)
+        else:
+            self.left_in1.off()
+            self.left_in2.off()
+            self.left_pwm.value = 0
+        
+        # Set right motor
+        if right_speed > 0:
+            self.right_in3.on()
+            self.right_in4.off()
+            self.right_pwm.value = min(abs(right_speed) / 100, 1.0)
+        elif right_speed < 0:
+            self.right_in3.off()
+            self.right_in4.on()
+            self.right_pwm.value = min(abs(right_speed) / 100, 1.0)
+        else:
+            self.right_in3.off()
+            self.right_in4.off()
+            self.right_pwm.value = 0
+        
+        if DEBUG_MODE:
+            print(f"Motor speeds set: L={left_speed:.1f}, R={right_speed:.1f}")
+    
+    def test_motors(self):
+        """Test all motor movements"""
+        print("Testing motors...")
+        
+        # Forward test
+        print("Testing forward motion (2 seconds)...")
+        self.set_speeds(50, 50)
+        time.sleep(2)
+        self.stop()
+        time.sleep(1)
+        
+        # Backward test
+        print("Testing backward motion (2 seconds)...")
+        self.set_speeds(-50, -50)
+        time.sleep(2)
+        self.stop()
+        time.sleep(1)
+        
+        # Left turn test
+        print("Testing left turn (2 seconds)...")
+        self.set_speeds(-30, 30)
+        time.sleep(2)
+        self.stop()
+        time.sleep(1)
+        
+        # Right turn test
+        print("Testing right turn (2 seconds)...")
+        self.set_speeds(30, -30)
+        time.sleep(2)
+        self.stop()
+        time.sleep(1)
+        
+        print("Motor test complete")
+    
+    def close(self):
+        """Release all resources"""
+        self.stop()
+        self.left_pwm.close()
+        self.left_in1.close()
+        self.left_in2.close()
+        self.right_pwm.close()
+        self.right_in3.close()
+        self.right_in4.close()
+
+# ===== PID CONTROLLER =====
+class PIDController:
+    def __init__(self, kp, ki, kd, windup_guard=20.0):
+        self.kp = kp  # Proportional gain
+        self.ki = ki  # Integral gain
+        self.kd = kd  # Derivative gain
+        self.windup_guard = windup_guard  # Anti-windup
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+        
+    def calculate(self, error):
+        # Time delta for better derivative and integral calculation
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        
+        # Avoid division by zero
+        if dt <= 0:
+            dt = 0.001
+            
+        # Proportional term
+        p_term = self.kp * error
+        
+        # Integral term with anti-windup
+        self.integral += error * dt
+        # Apply windup guard to prevent integral term from getting too large
+        if self.integral > self.windup_guard:
+            self.integral = self.windup_guard
+        elif self.integral < -self.windup_guard:
+            self.integral = -self.windup_guard
+            
+        i_term = self.ki * self.integral
+        
+        # Derivative term (with respect to time)
+        derivative = (error - self.prev_error) / dt
+        d_term = self.kd * derivative
+        self.prev_error = error
+        
+        # Calculate output
+        output = p_term + i_term + d_term
+        
+        return output
+    
+    def reset(self):
+        """Reset the PID controller when target is lost"""
+        self.prev_error = 0
+        self.integral = 0
+
+# ===== CAMERA HANDLER =====
+class CameraHandler:
+    def __init__(self, camera_id=0):
+        self.camera_id = camera_id
+        self.cap = None
+        self.width = 854
+        self.height = 480
+        self.crop_top = 1  # Crop from top
+        self.crop_bottom = 1  # Crop from bottom
+
+    def start(self):
+        """Initialize the camera with error handling"""
+        for i in range(3):  # Try up to 3 times
+            try:
+                self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_V4L2)
+                
+                # Try to maximize FOV with camera parameters
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Use smaller buffer for lower latency
+                
+                # Try to set camera FOV parameters (may not work on all cameras)
+                # Try to set a wider FOV mode if available
+                self.cap.set(cv2.CAP_PROP_ZOOM, 0.0)  # Minimum zoom for maximum FOV
+                self.cap.set(cv2.CAP_PROP_FOCUS, 0)   # Auto focus
+                
+                # Verify camera is working
+                ret, frame = self.cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    print(f"Camera initialized: {actual_width}x{actual_height}")
+                    
+                    # Display all camera properties for debugging
+                    self.print_camera_properties()
+                    
+                    return True
+                else:
+                    print(f"Camera initialization failed on attempt {i+1}, retrying...")
+                    self.cap.release()
+                    time.sleep(1)
+            except Exception as e:
+                print(f"Error initializing camera on attempt {i+1}: {e}")
+                if self.cap:
+                    self.cap.release()
+                time.sleep(1)
+        
+        print("CRITICAL: Could not initialize camera after multiple attempts")
+        return False
+    
+    def print_camera_properties(self):
+        """Print all camera properties for debugging"""
+        properties = [
+            (cv2.CAP_PROP_FRAME_WIDTH, "Width"),
+            (cv2.CAP_PROP_FRAME_HEIGHT, "Height"),
+            (cv2.CAP_PROP_FPS, "FPS"),
+            (cv2.CAP_PROP_ZOOM, "Zoom"),
+            (cv2.CAP_PROP_FOCUS, "Focus"),
+            (cv2.CAP_PROP_EXPOSURE, "Exposure"),
+            (cv2.CAP_PROP_BRIGHTNESS, "Brightness"),
+            (cv2.CAP_PROP_CONTRAST, "Contrast"),
+            (cv2.CAP_PROP_SATURATION, "Saturation"),
+            (cv2.CAP_PROP_HUE, "Hue"),
+            (cv2.CAP_PROP_GAIN, "Gain"),
+            (cv2.CAP_PROP_CONVERT_RGB, "Convert RGB"),
+            (cv2.CAP_PROP_WHITE_BALANCE_BLUE_U, "White Balance Blue"),
+            (cv2.CAP_PROP_WHITE_BALANCE_RED_V, "White Balance Red"),
+            (cv2.CAP_PROP_BUFFERSIZE, "Buffer Size"),
+        ]
+        
+        print("Camera properties:")
+        for prop, name in properties:
+            try:
+                value = self.cap.get(prop)
+                print(f"  {name}: {value}")
+            except:
+                pass
+    
+    def read_frame(self):
+        """Read a frame from the camera with cropping for wider aspect ratio"""
+        if not self.cap:
+            return False, None
+            
+        ret, frame = self.cap.read()
+        if not ret:
+            return False, None
+            
+        # Crop the frame to get a wider aspect ratio (if needed)
+        if self.crop_top > 0 or self.crop_bottom > 0:
+            h, w = frame.shape[:2]
+            if h > (self.crop_top + self.crop_bottom + 100):  # Ensure we don't crop too much
+                frame = frame[self.crop_top:(h-self.crop_bottom), :, :]
+                
+        return True, frame
+    
+    def close(self):
+        """Release the camera"""
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+# ===== ENHANCED OBSTACLE DETECTOR =====
+class ObstacleDetector:
+    def __init__(self, port=None, baud_rate=ESP32_BAUD, threshold=OBSTACLE_THRESHOLD):
+        self.port_name = port
+        self.baud_rate = baud_rate
+        self.threshold = threshold
+        self.serial = None
+        
+        # Initialize distance values (large values = no obstacle)
+        self.center_distance = 999
+        self.left_distance = 999
+        self.right_distance = 999
+        self.back_distance = 999
+        
+        # New navigation data from secondary ESP32
+        self.compass_heading = 0.0
+        self.precise_distance = 0.0
+        
+        # Thread control
+        self.running = False
+        self.thread = None
+        self.connected = False
+    
+    def auto_detect_port(self):
+        """Auto-detect ESP32 USB port"""
+        if self.port_name:
+            return self.port_name
+        
+        # Look for USB serial ports
+        import glob
+        ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+        
+        for port in ports:
+            try:
+                print(f"Trying {port}...")
+                ser = serial.Serial(port, self.baud_rate, timeout=2)
+                # Wait briefly for any data
+                time.sleep(1)
+                if ser.in_waiting:
+                    data = ser.readline().decode('utf-8').strip()
+                    if '<' in data and '>' in data:
+                        ser.close()
+                        print(f"ESP32 found on {port}")
+                        return port
+                ser.close()
+            except Exception as e:
+                print(f"Error with {port}: {e}")
+        
+        return None
+    
+    def start(self):
+        """Start the detector thread"""
+        # Auto-detect port if not specified
+        if not self.port_name:
+            self.port_name = self.auto_detect_port()
+            if not self.port_name:
+                print("ERROR: ESP32 USB port not found!")
+                self.connected = False
+                return False
+        
+        try:
+            # Open serial connection
+            self.serial = serial.Serial(
+                port=self.port_name,
+                baudrate=self.baud_rate,
+                timeout=1.0
+            )
+            
+            # Flush any existing data
+            self.serial.reset_input_buffer()
+            
+            # Start reading thread
+            self.running = True
+            self.thread = threading.Thread(target=self._read_loop)
+            self.thread.daemon = True
+            self.thread.start()
+            
+            self.connected = True
+            print(f"Obstacle detector and navigation system started on {self.port_name}")
+            return True
+            
+        except Exception as e:
+            print(f"Error starting obstacle detector: {str(e)}")
+            self.connected = False
+            return False
+    
+    def stop(self):
+        """Stop the detector thread"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        if self.serial:
+            self.serial.close()
+        print("Obstacle detector stopped")
+    
+    def _read_loop(self):
+        """Main loop for reading data from ESP32"""
+        while self.running:
+            try:
+                if self.serial and self.serial.in_waiting:
+                    # Read a line of data
+                    line = self.serial.readline().decode('utf-8').strip()
+                    
+                    # Parse the data - modified format: <C:123.4,L:123.4,R:123.4,B:123.4,H:123.4,D:123.4>
+                    if line.startswith('<') and line.endswith('>'):
+                        data = line[1:-1]  # Remove < >
+                        parts = data.split(',')
+                        
+                        if len(parts) >= 4:  # At least the ultrasonic sensor data
+                            try:
+                                # Parse each value
+                                for part in parts:
+                                    key, value = part.split(':')
+                                    value = float(value)
+                                    
+                                    if key == 'C':
+                                        self.center_distance = value
+                                    elif key == 'L':
+                                        self.left_distance = value
+                                    elif key == 'R':
+                                        self.right_distance = value
+                                    elif key == 'B':
+                                        self.back_distance = value
+                                    elif key == 'H':
+                                        self.compass_heading = value
+                                    elif key == 'D':
+                                        self.precise_distance = value
+                                
+                                if DEBUG_MODE and time.time() % 3 < 0.1:  # Print every ~3 seconds
+                                    print(f"Sensors: F:{self.center_distance:.1f} L:{self.left_distance:.1f} "
+                                          f"R:{self.right_distance:.1f} B:{self.back_distance:.1f} "
+                                          f"Heading:{self.compass_heading:.1f}° Dist:{self.precise_distance:.1f}cm")
+                            
+                            except (ValueError, IndexError) as e:
+                                if DEBUG_MODE:
+                                    print(f"Error parsing data: {e}, data: {line}")
+            
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"Error reading from serial: {e}")
+                time.sleep(0.1)
+    
+    def get_distances(self):
+        """Get all distance readings and navigation data"""
+        return {
+            'center': self.center_distance,
+            'left': self.left_distance,
+            'right': self.right_distance,
+            'back': self.back_distance,
+            'heading': self.compass_heading,
+            'precise_distance': self.precise_distance
+        }
+    
+    def is_obstacle_front(self):
+        """Check if there's an obstacle in front"""
+        return self.center_distance < self.threshold
+    
+    def is_obstacle_left(self):
+        """Check if there's an obstacle on the left"""
+        return self.left_distance < self.threshold
+    
+    def is_obstacle_right(self):
+        """Check if there's an obstacle on the right"""
+        return self.right_distance < self.threshold
+    
+    def is_obstacle_back(self):
+        """Check if there's an obstacle in the back"""
+        return self.back_distance < self.threshold
+    
+    def get_heading(self):
+        """Get compass heading in degrees (0-359)"""
+        return self.compass_heading
+    
+    def get_precise_distance(self):
+        """Get precise distance reading from Time-of-Flight sensor"""
+        return self.precise_distance
+    
+    def get_safe_direction(self):
+        """
+        Determine the safest direction to move
+        
+        Returns:
+            str: 'forward', 'left', 'right', 'backward', or 'stop'
+        """
+        front_clear = not self.is_obstacle_front()
+        left_clear = not self.is_obstacle_left()
+        right_clear = not self.is_obstacle_right()
+        back_clear = not self.is_obstacle_back()
+        
+        # If all directions are blocked, stop
+        if not (front_clear or left_clear or right_clear or back_clear):
+            return 'stop'
+        
+        # Prefer to go forward if possible
+        if front_clear:
+            return 'forward'
+        
+        # Otherwise, choose the clearest direction
+        distances = [
+            (self.left_distance, 'left'),
+            (self.right_distance, 'right'),
+            (self.back_distance, 'backward')
+        ]
+        
+        # Sort by distance (descending) and return the direction with the most space
+        distances.sort(reverse=True)
+        return distances[0][1]
+    
+    def get_navigation_suggestion(self, target_heading):
+        """
+        Calculate needed turn direction to align with target heading
+        
+        Args:
+            target_heading: Target compass heading in degrees
+            
+        Returns:
+            turn_amount: Amount to turn (-1.0 to 1.0, negative is left)
+        """
+        # Calculate difference between current and target heading
+        diff = (target_heading - self.compass_heading + 180) % 360 - 180
+        
+        # Normalize to -1.0 to 1.0 range
+        turn_amount = max(-1.0, min(1.0, diff / 90.0))
+        
+        return turn_amount
+
+# ===== ENHANCED ARUCO TRACKING ROBOT =====
+class ArucoTrackingRobot:
+    def __init__(self):
+        # Initialize controllers
+        self.motors = MotorController()
+        self.detector = ObstacleDetector(port=ESP32_PORT)
+        self.camera = CameraHandler()
+        
+        # Initialize PID controllers
+        self.position_pid = PIDController(kp=1.0, ki=0.01, kd=0.2, windup_guard=15.0)
+        self.distance_pid = PIDController(kp=0.7, ki=0.02, kd=0.1, windup_guard=10.0)
+        self.heading_pid = PIDController(kp=0.8, ki=0.01, kd=0.1, windup_guard=20.0)  # New PID for heading
+        
+        # Aruco marker setup
+        self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_7X7_50)
+        self.parameters = cv2.aruco.DetectorParameters_create()
+        
+        # Performance optimizations
+        self.parameters.adaptiveThreshWinSizeMin = 3
+        self.parameters.adaptiveThreshWinSizeMax = 15
+        self.parameters.adaptiveThreshWinSizeStep = 4
+        self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+        
+        # Tracking state
+        self.position_history = []
+        self.max_history = 5
+        self.last_known_position = None
+        self.last_known_direction = "center"
+        
+        # New navigation values
+        self.last_known_heading = None
+        self.target_heading = None
+        self.last_fused_distance = None
+        
+        # Marker timing
+        self.last_detection_time = time.time()
+        self.marker_timeout = 0.5  # If no marker for 0.5 second, start search
+        
+        # Search behavior
+        self.search_speed = 25
+        self.search_direction = 1  # 1 for right, -1 for left
+        self.max_search_time = 10.0  # Maximum time to search in one direction
+        self.search_start_time = 0
+        
+        # Speed settings
+        self.min_speed = 20
+        self.max_speed = 70  # Max 70% to prevent current issues
+        
+        # Status flags
+        self.running = False
+        self.obstacle_avoidance = OBSTACLE_AVOIDANCE_MODE
+        self.use_enhanced_navigation = True  # Use secondary ESP32 navigation data
+    
+    def fuse_distance_data(self, visual_distance, rssi_distance):
+        """
+        Fuse distance estimates from ArUco marker (visual) and RSSI
+        """
+        # If either measurement is invalid, use the other one
+        if visual_distance < 0:
+            return rssi_distance
+        if rssi_distance < 0:
+            return visual_distance
+        
+        # Calculate confidence based on distance (ArUco more reliable at close range)
+        visual_confidence = max(0.1, min(0.9, 400 / (visual_distance + 100)))
+        rssi_confidence = 1.0 - visual_confidence
+        
+        # Apply Kalman-inspired fusion (simplified)
+        fused_distance = (visual_distance * visual_confidence + 
+                          rssi_distance * rssi_confidence) / (visual_confidence + rssi_confidence)
+        
+        # Add some temporal smoothing (simple IIR filter)
+        if self.last_fused_distance is not None:
+            fused_distance = 0.7 * fused_distance + 0.3 * self.last_fused_distance
+        
+        self.last_fused_distance = fused_distance
+        return fused_distance
+    
+    def start(self):
+        """Initialize and start the robot"""
+        print("\n===============================================")
+        print("Starting Enhanced Aruco Tracking Robot with BLE Navigation")
+        print("Target distance: 100cm")
+        print("Press 'q' to quit, 'm' to test motors, 'o' to toggle obstacle avoidance")
+        print("Press 'n' to toggle enhanced navigation")
+        print("===============================================\n")
+        
+        # Initialize camera
+        if not self.camera.start():
+            print("ERROR: Failed to initialize camera!")
+            return False
+        
+        # Initialize obstacle detector and navigation system
+        if self.obstacle_avoidance:
+            if not self.detector.start():
+                print("WARNING: Could not start obstacle detector. Running without obstacle avoidance.")
+                self.obstacle_avoidance = False
+                self.use_enhanced_navigation = False
+            else:
+                print("Obstacle detector and navigation system started successfully.")
+        
+        # Test motors if enabled
+        if TEST_MOTORS_ON_START:
+            self.motors.test_motors()
+        
+        self.running = True
+        return True
+    
+    def stop(self):
+        """Stop the robot and release resources"""
+        print("Stopping robot...")
+        self.running = False
+        self.motors.stop()
+        
+        # Clean up
+        self.camera.close()
+        if self.obstacle_avoidance:
+            self.detector.stop()
+        self.motors.close()
+        
+        print("Robot stopped safely.")
+    
+    def calculate_motor_speeds(self, dx, distance_cm):
+        """Calculate motor speeds based on marker position and distance"""
+        # For turning (position control) - negative dx means turn left
+        position_error = -dx / (self.camera.width / 2)  # Normalize to range -1 to 1
+        turn_power = self.position_pid.calculate(position_error)
+        
+        # For forward/backward (distance control)
+        distance_error = (TARGET_DISTANCE - distance_cm) / TARGET_DISTANCE  # Normalize
+        speed_power = self.distance_pid.calculate(distance_error)
+        
+        # Calculate base speed based on distance
+        if distance_cm <= TARGET_DISTANCE:
+            forward_speed = 0
+            # If too close, back up
+            if distance_cm < TARGET_DISTANCE - DISTANCE_THRESHOLD:
+                # Calculate backward speed (negative)
+                backward_ratio = (TARGET_DISTANCE - distance_cm) / TARGET_DISTANCE
+                forward_speed = -self.min_speed - backward_ratio * (self.max_speed - self.min_speed)
+                forward_speed = max(-self.max_speed, forward_speed)  # Cap backward speed
+        else:
+            # Scale speed based on distance (farther = faster)
+            distance_ratio = min(1.0, (distance_cm - TARGET_DISTANCE) / 200)  # 200cm range
+            forward_speed = self.min_speed + distance_ratio * (self.max_speed - self.min_speed)
+        
+        # Apply differential steering
+        if abs(dx) > POSITION_THRESHOLD:
+            # Apply turn power (weighted more when close to maintain heading)
+            turn_weight = 40 - min(30, max(0, distance_cm - TARGET_DISTANCE) * 0.1)
+            left_speed = forward_speed + turn_power * turn_weight
+            right_speed = forward_speed - turn_power * turn_weight
+        else:
+            # Centered, just use forward/backward speed
+            left_speed = forward_speed
+            right_speed = forward_speed
+        
+        # Clamp speeds
+        left_speed = max(-self.max_speed, min(self.max_speed, left_speed))
+        right_speed = max(-self.max_speed, min(self.max_speed, right_speed))
+        
+        return left_speed, right_speed
+    
+    def adjust_speeds_with_compass(self, base_left, base_right, target_heading):
+        """Adjust motor speeds based on compass heading"""
+        if not self.obstacle_avoidance or not self.detector.connected or not self.use_enhanced_navigation:
+            return base_left, base_right
+            
+        # Get turn amount (-1.0 to 1.0) to align with target heading
+        turn_amount = self.detector.get_navigation_suggestion(target_heading)
+        
+        # Calculate heading error for PID
+        # Convert circular heading error to -180 to 180 range
+        heading_diff = (target_heading - self.detector.get_heading() + 180) % 360 - 180
+        heading_error = heading_diff / 180.0  # Normalize to -1 to 1
+        
+        # Get PID output for smoother control
+        turn_correction = self.heading_pid.calculate(heading_error)
+        
+        # Apply heading correction with weight
+        heading_weight = 25
+        heading_adjustment = turn_correction * heading_weight
+        
+        # Apply to base speeds
+        left_speed = base_left + heading_adjustment
+        right_speed = base_right - heading_adjustment
+        
+        return left_speed, right_speed
+    
+    def handle_obstacles(self, left_speed, right_speed, forward_speed):
+        """Modify speeds based on obstacle detection"""
+        if not self.obstacle_avoidance or not self.detector.connected:
+            return left_speed, right_speed
+        
+        # If moving forward and obstacle in front
+        if forward_speed > 0 and self.detector.is_obstacle_front():
+            # Determine safe direction
+            safe_dir = self.detector.get_safe_direction()
+            
+            if safe_dir == 'stop':
+                # All directions blocked - stop
+                return 0, 0
+            
+            elif safe_dir == 'left':
+                # Turn left to avoid
+                return -40, 40
+            
+            elif safe_dir == 'right':
+                # Turn right to avoid
+                return 40, -40
+            
+            elif safe_dir == 'backward':
+                # Back up
+                return -40, -40
+        
+        # If moving backward and obstacle behind
+        elif forward_speed < 0 and self.detector.is_obstacle_back():
+            # Stop backing up
+            return 0, 0
+        
+        # If turning left and obstacle on left
+        elif left_speed < right_speed and self.detector.is_obstacle_left():
+            # Stop turning left
+            return right_speed, right_speed
+        
+        # If turning right and obstacle on right
+        elif right_speed < left_speed and self.detector.is_obstacle_right():
+            # Stop turning right
+            return left_speed, left_speed
+        
+        # No obstacle issues
+        return left_speed, right_speed
+    
+    def search_behavior(self):
+        """Handle search when marker is lost"""
+        current_time = time.time()
+        
+        # If this is the first frame of search, note
+def search_behavior(self):
+        """Handle search when marker is lost"""
+        current_time = time.time()
+        
+        # If this is the first frame of search, note the time
+        if self.search_start_time == 0:
+            self.search_start_time = current_time
+            # Reset PIDs to avoid accumulated errors
+            self.position_pid.reset()
+            self.distance_pid.reset()
+            self.heading_pid.reset()
+        
+        # Calculate how long we've been searching
+        search_duration = current_time - self.search_start_time
+        
+        # Check if we need to change search direction
+        if search_duration > self.max_search_time:
+            # Flip the search direction
+            self.search_direction = -self.search_direction
+            self.search_start_time = current_time  # Reset timer
+            print(f"Changing search direction after {self.max_search_time} seconds")
+        
+        # Determine initial search direction based on last known position
+        if self.search_start_time == current_time:  # Only on first frame of search
+            if self.last_known_direction == "left":
+                self.search_direction = -1  # Turn left to find marker
+            elif self.last_known_direction == "right":
+                self.search_direction = 1   # Turn right to find marker
+            else:
+                # If we don't know, use default (right)
+                self.search_direction = 1
+        
+        # Calculate search speeds
+        left_speed = self.search_speed * -self.search_direction
+        right_speed = self.search_speed * self.search_direction
+        
+        # Check for obstacles during search if enabled
+        if self.obstacle_avoidance and self.detector.connected:
+            # If turning left and obstacle on left, reverse direction
+            if self.search_direction == -1 and self.detector.is_obstacle_left():
+                self.search_direction = 1
+                left_speed = self.search_speed * -self.search_direction
+                right_speed = self.search_speed * self.search_direction
+                
+            # If turning right and obstacle on right, reverse direction
+            elif self.search_direction == 1 and self.detector.is_obstacle_right():
+                self.search_direction = -1
+                left_speed = self.search_speed * -self.search_direction
+                right_speed = self.search_speed * self.search_direction
+        
+        # Enhanced search with compass if available
+        if self.use_enhanced_navigation and self.target_heading is not None:
+            # Use the last known target heading to guide search
+            left_speed, right_speed = self.adjust_speeds_with_compass(left_speed, right_speed, self.target_heading)
+            search_msg = f"GUIDED SEARCH (Target: {self.target_heading:.1f}°)"
+        else:
+            search_msg = "SEARCHING " + ("LEFT" if self.search_direction < 0 else "RIGHT")
+        
+        return left_speed, right_speed, search_msg
+    
+    def process_frame(self, frame):
+        """Process a single frame and update robot state"""
+        # Get frame dimensions
+        height, width = frame.shape[:2]
+        
+        # Convert to grayscale for faster processing
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect Aruco markers
+        corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.parameters)
+        
+        # Create output frame
+        output = frame.copy()
+        
+        # Draw center cross
+        cv2.line(output, (width//2, 0), (width//2, height), (0, 255, 0), 1)
+        cv2.line(output, (0, height//2), (width, height//2), (0, 255, 0), 1)
+        
+        # Check if we need to start search behavior
+        current_time = time.time()
+        marker_lost = (current_time - self.last_detection_time) > self.marker_timeout
+        
+        # Display obstacle information if enabled
+        if self.obstacle_avoidance and self.detector.connected:
+            distances = self.detector.get_distances()
+            
+            # Visual indicators for obstacles
+            if self.detector.is_obstacle_front():
+                cv2.circle(output, (width//2, 20), 10, (0, 0, 255), -1)
+            if self.detector.is_obstacle_left():
+                cv2.circle(output, (20, height//2), 10, (0, 0, 255), -1)
+            if self.detector.is_obstacle_right():
+                cv2.circle(output, (width-20, height//2), 10, (0, 0, 255), -1)
+            if self.detector.is_obstacle_back():
+                cv2.circle(output, (width//2, height-20), 10, (0, 0, 255), -1)
+            
+            # Display obstacle information
+            cv2.putText(output, 
+                f"Obstacles - F:{distances['center']:.1f} L:{distances['left']:.1f} R:{distances['right']:.1f} B:{distances['back']:.1f}", 
+                (10, height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            
+            # Add navigation data display
+            cv2.putText(output, 
+                f"Nav - Heading:{distances['heading']:.1f}° Dist:{distances['precise_distance']:.1f}cm", 
+                (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            
+            # Draw compass heading indicator
+            heading_rad = math.radians(distances['heading'])
+            compass_x = width - 50
+            compass_y = 50
+            compass_length = 30
+            end_x = int(compass_x + compass_length * math.sin(heading_rad))
+            end_y = int(compass_y - compass_length * math.cos(heading_rad))
+            cv2.circle(output, (compass_x, compass_y), compass_length, (0, 255, 0), 1)
+            cv2.line(output, (compass_x, compass_y), (end_x, end_y), (0, 0, 255), 2)
+            cv2.putText(output, "N", (compass_x-5, compass_y-compass_length-5), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Draw status text
+        cv2.putText(output, f"Obstacle Avoidance: {'ON' if self.obstacle_avoidance else 'OFF'}", 
+                  (width - 230, height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                  (0, 255, 0) if self.obstacle_avoidance else (0, 0, 255), 1)
+        cv2.putText(output, f"Enhanced Navigation: {'ON' if self.use_enhanced_navigation else 'OFF'}", 
+                  (width - 230, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                  (0, 255, 0) if self.use_enhanced_navigation else (0, 0, 255), 1)
+        
+        # Track specific marker
+        marker_found = False
+        if ids is not None and len(ids) > 0:
+            # Draw all detected markers
+            cv2.aruco.drawDetectedMarkers(output, corners, ids)
+            
+            # Find our specific marker
+            for i, id_val in enumerate(ids):
+                if id_val[0] == MARKER_ID:
+                    marker_found = True
+                    self.last_detection_time = current_time
+                    self.search_start_time = 0  # Reset search timer
+                    
+                    # Get the corners and calculate center
+                    corner = corners[i][0]
+                    center_x = int(np.mean(corner[:, 0]))
+                    center_y = int(np.mean(corner[:, 1]))
+                    
+                    # Update tracking info
+                    self.last_known_position = (center_x, center_y)
+                    
+                    # Determine direction for search if lost
+                    if center_x < width//2 - POSITION_THRESHOLD:
+                        self.last_known_direction = "right"  # If marker is on left, search right
+                    elif center_x > width//2 + POSITION_THRESHOLD:
+                        self.last_known_direction = "left"   # If marker is on right, search left
+                    else:
+                        self.last_known_direction = "center"
+                    
+                    # Update position history
+                    self.position_history.append((center_x, center_y))
+                    if len(self.position_history) > self.max_history:
+                        self.position_history.pop(0)
+                    
+                    # Draw marker center and tracking trail
+                    cv2.circle(output, (center_x, center_y), 5, (0, 0, 255), -1)
+                    if len(self.position_history) > 1:
+                        for j in range(1, len(self.position_history)):
+                            cv2.line(output, self.position_history[j-1], self.position_history[j], (255, 0, 0), 2)
+                    
+                    # Calculate marker size and distance
+                    dx = center_x - width//2  # Offset from center
+                    
+                    sides = []
+                    for j in range(4):
+                        next_j = (j + 1) % 4
+                        sides.append(np.sqrt((corner[j][0] - corner[next_j][0])**2 + 
+                                             (corner[j][1] - corner[next_j][1])**2))
+                    
+                    marker_size_pixels = np.mean(sides)
+                    distance_cm = (MARKER_SIZE_CM * FOCAL_LENGTH) / marker_size_pixels
+                    
+                    # Apply data fusion with RSSI-based distance if available
+                    if self.use_enhanced_navigation and self.obstacle_avoidance and self.detector.connected:
+                        rssi_distance = self.detector.get_precise_distance()
+                        if rssi_distance > 0:
+                            # Log both distances for debugging
+                            if DEBUG_MODE:
+                                print(f"Visual dist: {distance_cm:.1f}cm, RSSI dist: {rssi_distance:.1f}cm")
+                            
+                            # Apply data fusion
+                            distance_cm = self.fuse_distance_data(distance_cm, rssi_distance)
+                            
+                            # Log fused result
+                            if DEBUG_MODE:
+                                print(f"Fused distance: {distance_cm:.1f}cm")
+                    
+                    # Calculate base motor speeds from ArUco marker
+                    left_speed, right_speed = self.calculate_motor_speeds(dx, distance_cm)
+                    
+                    # Enhanced navigation with compass data
+                    if self.use_enhanced_navigation and self.obstacle_avoidance and self.detector.connected:
+                        # If we have a valid heading, use compass to enhance heading
+                        if self.last_known_heading is None:
+                            # Initialize target heading based on current heading
+                            self.last_known_heading = self.detector.get_heading()
+                        
+                        # Update target heading based on marker position
+                        heading_adjustment = dx / (self.camera.width / 2) * 45  # Scale to ±45 degrees
+                        self.target_heading = (self.last_known_heading + heading_adjustment) % 360
+                        
+                        # Apply compass-based navigation
+                        left_speed, right_speed = self.adjust_speeds_with_compass(
+                            left_speed, right_speed, self.target_heading)
+                    
+                    # Apply obstacle avoidance if enabled
+                    left_speed, right_speed = self.handle_obstacles(left_speed, right_speed, 
+                                                                 forward_speed=(left_speed + right_speed)/2)
+                    
+                    # Set motor speeds
+                    self.motors.set_speeds(left_speed, right_speed)
+                    
+                    # Draw information on frame
+                    cv2.putText(output, f"Distance: {distance_cm:.2f} cm", (10, 30), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(output, f"Offset: {dx}", (10, 50), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(output, f"Motors: L={left_speed:.1f}, R={right_speed:.1f}", (10, 70), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Direction indicator
+                    direction = ""
+                    if dx < -POSITION_THRESHOLD:
+                        direction += "Left "
+                    elif dx > POSITION_THRESHOLD:
+                        direction += "Right "
+                    else:
+                        direction += "Center "
+                        
+                    if distance_cm < TARGET_DISTANCE - DISTANCE_THRESHOLD:
+                        direction += "Too Close"
+                    elif distance_cm > TARGET_DISTANCE + DISTANCE_THRESHOLD:
+                        direction += "Too Far"
+                    else:
+                        direction += "Good Distance"
+                    
+                    cv2.putText(output, f"Direction: {direction}", (10, 90), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Add target heading if using enhanced navigation
+                    if self.use_enhanced_navigation and self.target_heading is not None:
+                        cv2.putText(output, f"Target heading: {self.target_heading:.1f}°", (10, 110), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Search behavior if marker is lost
+        if not marker_found and marker_lost:
+            left_speed, right_speed, search_message = self.search_behavior()
+            
+            # Set motor speeds for search
+            self.motors.set_speeds(left_speed, right_speed)
+            
+            # Display search status
+            cv2.putText(output, f"STATUS: {search_message}", (10, 50), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(output, f"Motors: L={left_speed:.1f}, R={right_speed:.1f}", (10, 70), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        
+        return output
+    
+    def run(self):
+        """Main run loop"""
+        if not self.running:
+            if not self.start():
+                return
+        
+        try:
+            while self.running:
+                # Read frame
+                ret, frame = self.camera.read_frame()
+                if not ret:
+                    print("Failed to capture image")
+                    time.sleep(0.1)
+                    continue
+                
+                # Process frame
+                output = self.process_frame(frame)
+                
+                # Display the frame
+                cv2.imshow('Enhanced ArUco Tracking Robot', output)
+                
+                # Handle key presses
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('m'):
+                    # Test motors
+                    self.motors.test_motors()
+                elif key == ord('o'):
+                    # Toggle obstacle avoidance
+                    self.obstacle_avoidance = not self.obstacle_avoidance
+                    print(f"Obstacle avoidance: {'ON' if self.obstacle_avoidance else 'OFF'}")
+                elif key == ord('n'):
+                    # Toggle enhanced navigation
+                    self.use_enhanced_navigation = not self.use_enhanced_navigation
+                    print(f"Enhanced navigation: {'ON' if self.use_enhanced_navigation else 'OFF'}")
+        
+        finally:
+            self.stop()
+            cv2.destroyAllWindows()
+
+# ===== MAIN PROGRAM =====
+if __name__ == "__main__":
+    # Create and run the robot
+    robot = ArucoTrackingRobot()
+    robot.run()
